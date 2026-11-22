@@ -20,9 +20,10 @@
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <!-- Boot, Foreground Service & Home Screen Shortcut Permissions (Android 1.6 to Android 15+) -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"  />
+    <!-- Replace FOREGROUND_SERVICE_DATA_SYNC with FOREGROUND_SERVICE_SPECIAL_USE -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT" />
 
@@ -71,8 +72,11 @@
         <service
             android:name=".AndroluaService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
-
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local Lua script automation and SQLite HTTP service" />
+        </service>
         <receiver
             android:name=".BootReceiver"
             android:directBootAware="true"
