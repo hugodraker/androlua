@@ -1,0 +1,36 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.HUGO.androlua'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.HUGO.androlua"
+        minSdk 4
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+        multiDexEnabled false
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation 'org.luaj:luaj-jse:3.0.1'
+    implementation 'org.sqldroid:sqldroid:1.0.3'
+}
