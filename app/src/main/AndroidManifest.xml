@@ -19,9 +19,8 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
-    <!-- Boot, Foreground Service & Home Screen Shortcut Permissions (Android 1.6 to Android 15+) -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"  />
-    <!-- Replace FOREGROUND_SERVICE_DATA_SYNC with FOREGROUND_SERVICE_SPECIAL_USE -->
+    <!-- Boot, Foreground Service & Home Screen Shortcut Permissions -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -58,7 +57,7 @@
             android:taskAffinity=""
             android:exported="true">
             <intent-filter>
-                <action android:name="com.example.androlua.ACTION_RUN_SHORTCUT" />
+                <action android:name="HUGO.androlua.ACTION_RUN_SHORTCUT" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
@@ -77,6 +76,7 @@
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Local Lua script automation and SQLite HTTP service" />
         </service>
+
         <receiver
             android:name=".BootReceiver"
             android:directBootAware="true"
