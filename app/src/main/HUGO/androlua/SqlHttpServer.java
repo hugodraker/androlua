@@ -40,7 +40,7 @@ public class SqlHttpServer {
     private Thread acceptThread;
     private volatile boolean running = false;
     private int boundPort = -1;
-    private SyncRunner.LogCallback logger;
+    private ScriptRunner.LogCallback logger;
 
     public static synchronized SqlHttpServer getInstance(Context ctx) {
         if (instance == null) {
@@ -54,7 +54,7 @@ public class SqlHttpServer {
         this.appContext = appCtx;
     }
 
-    public void setLogger(SyncRunner.LogCallback l) {
+    public void setLogger(ScriptRunner.LogCallback l) {
         this.logger = l;
     }
 
@@ -98,7 +98,7 @@ public class SqlHttpServer {
                     boundPort = -1;
                 }
             }
-        }, "AsyncerSqlHttpServer");
+        }, "AndroLuaSqlHttpServer");
         acceptThread.start();
     }
 
@@ -143,7 +143,7 @@ public class SqlHttpServer {
                     String hv = headerLine.substring(colon + 1).trim();
                     headers.put(hk, hv);
                     if ("content-length".equals(hk)) {
-                        contentLength = SyncRunner.parseIntSafe(hv, 0);
+                        contentLength = ScriptRunner.parseIntSafe(hv, 0);
                     }
                 }
             }
@@ -159,7 +159,7 @@ public class SqlHttpServer {
                 }
             }
 
-            SyncRunner.IniConfig cfg = SyncRunner.loadIniConfig(new File(appContext.getFilesDir(), "asyncer.ini"));
+            ScriptRunner.IniConfig cfg = ScriptRunner.loadIniConfig(new File(appContext.getFilesDir(), "androlua.ini"));
             boolean enabled = "1".equals(cfg.global.get("sql_server_enabled")) || "true".equalsIgnoreCase(cfg.global.get("sql_server_enabled"));
             if (!enabled) {
                 sendResponse(out, 503, "application/json; charset=UTF-8",
@@ -167,7 +167,6 @@ public class SqlHttpServer {
                 return;
             }
 
-            // GET / -> Show login form only (no console access until authenticated via POST)
             if ("GET".equals(method) && "/".equals(path)) {
                 sendResponse(out, 200, "text/html; charset=UTF-8", buildLoginHtml(null));
                 return;
@@ -179,7 +178,6 @@ public class SqlHttpServer {
                 return;
             }
 
-            // Parse credentials & parameters strictly from POST body (and optional auth headers)
             Map<String, String> postParams = new HashMap<String, String>();
             String contentType = headers.get("content-type");
             String bodyStr = new String(bodyBytes, "UTF-8");
@@ -200,7 +198,6 @@ public class SqlHttpServer {
                 } else if (!validCreds) {
                     sendResponse(out, 401, "text/html; charset=UTF-8", buildLoginHtml("Invalid username or password."));
                 } else {
-                    // Authenticated: render console WITHOUT login/password fields
                     sendResponse(out, 200, "text/html; charset=UTF-8", buildAuthenticatedConsoleHtml(creds[0], creds[1]));
                 }
                 return;
@@ -214,8 +211,8 @@ public class SqlHttpServer {
 
             if ("/sql".equals(path)) {
                 handleSqlPost(out, cfg.global, postParams, isRawSqlBody ? bodyStr : null);
-            } else if ("/run_job".equals(path)) {
-                handleRunJobPost(out, postParams);
+            } else if ("/run_script".equals(path) || "/run_job".equals(path)) {
+                handleRunScriptPost(out, cfg, postParams);
             } else {
                 sendResponse(out, 404, "application/json; charset=UTF-8",
                         "{\"ok\":false,\"error\":\"Unknown endpoint: " + escapeJson(path) + "\"}");
@@ -234,7 +231,6 @@ public class SqlHttpServer {
         }
     }
 
-    // Returns [user, pass] only if BOTH user and pass were explicitly supplied in POST or Auth headers
     private String[] extractCredentials(Map<String, String> headers, Map<String, String> postParams) {
         if (postParams.containsKey("user") && postParams.containsKey("pass")) {
             return new String[] { postParams.get("user"), postParams.get("pass") };
@@ -261,8 +257,7 @@ public class SqlHttpServer {
     private boolean verifyCredentials(Map<String, String> globalCfg, String reqUser, String reqPass) {
         String expectedUser = globalCfg.containsKey("http_user") ? globalCfg.get("http_user") : "admin";
         String expectedPass = globalCfg.containsKey("http_pass") ? globalCfg.get("http_pass") : "";
-        if (reqUser == null || reqPass == null) return false;
-        if (expectedUser.length() == 0) return false;
+        if (reqUser == null || reqPass == null || expectedUser.length() == 0) return false;
         return expectedUser.equals(reqUser) && expectedPass.equals(reqPass);
     }
 
@@ -287,7 +282,7 @@ public class SqlHttpServer {
 
         if (sql == null || sql.trim().length() == 0) {
             sendResponse(out, 400, "application/json; charset=UTF-8",
-                    "{\"ok\":false,\"error\":\"Missing SQL query (supply query_b64, query, or raw body)\"}");
+                    "{\"ok\":false,\"error\":\"Missing SQL query\"}");
             return;
         }
 
@@ -297,7 +292,7 @@ public class SqlHttpServer {
         }
         if (dbPath == null || dbPath.trim().length() == 0) {
             File ext = Environment.getExternalStorageDirectory();
-            dbPath = new File(ext != null ? ext : appContext.getFilesDir(), "asyncer.db").getAbsolutePath();
+            dbPath = new File(ext != null ? ext : appContext.getFilesDir(), "androlua.db").getAbsolutePath();
         }
 
         log("HTTP SQL [" + new File(dbPath).getName() + "]: " + (sql.length() > 80 ? sql.substring(0, 80) + "..." : sql));
@@ -347,45 +342,51 @@ public class SqlHttpServer {
         sendResponse(out, 200, "application/json; charset=UTF-8", json.toString());
     }
 
-    private void handleRunJobPost(OutputStream out, Map<String, String> params) throws Exception {
-        String jobParam = params.get("job");
-        if (jobParam == null || jobParam.trim().length() == 0) {
-            jobParam = params.get("profile");
+    private void handleRunScriptPost(OutputStream out, ScriptRunner.IniConfig cfg, Map<String, String> params) throws Exception {
+        if (params.containsKey("code_b64") && params.get("code_b64").length() > 0) {
+            String luaCode = new String(decodeBase64Flexible(params.get("code_b64")), "UTF-8");
+            log("HTTP POST /run_script -> executing inline Base64 Lua");
+            String status = ScriptRunner.executeLuaCodeString(appContext, null, luaCode, "http_inline.lua", null, logger);
+            sendResponse(out, 200, "application/json; charset=UTF-8",
+                    "{\"ok\":true,\"status\":\"" + escapeJson(status) + "\"}");
+            return;
         }
-        if (jobParam == null || jobParam.trim().length() == 0) {
+
+        String path = params.get("path");
+        if (path != null && path.trim().length() > 0) {
+            log("HTTP POST /run_script -> path=" + path.trim());
+            String status = ScriptRunner.executeCommandOrLua(appContext, null, path.trim(), null, logger);
+            sendResponse(out, 200, "application/json; charset=UTF-8",
+                    "{\"ok\":true,\"path\":\"" + escapeJson(path.trim()) + "\",\"status\":\"" + escapeJson(status) + "\"}");
+            return;
+        }
+
+        String slotParam = params.containsKey("script") ? params.get("script") : params.get("job");
+        if (slotParam == null || slotParam.trim().length() == 0) {
             sendResponse(out, 400, "application/json; charset=UTF-8",
-                    "{\"ok\":false,\"error\":\"Missing 'job' parameter (1..5 or all)\"}");
+                    "{\"ok\":false,\"error\":\"Supply 'path', 'code_b64', or 'script' (1..N or all)\"}");
             return;
         }
 
-        String jp = jobParam.trim();
-        boolean runScript = !"0".equals(params.get("run_script"));
-        log("HTTP POST /run_job -> job=" + jp);
-
-        if ("all".equalsIgnoreCase(jp)) {
-            StringBuilder resultsJson = new StringBuilder();
-            resultsJson.append("{\"ok\":true,\"results\":[");
-            for (int i = 0; i < 5; i++) {
-                if (i > 0) resultsJson.append(',');
-                String r = SyncRunner.runJobAndScript(appContext, null, i, runScript, logger);
-                resultsJson.append("{\"job\":").append(i + 1).append(",\"status\":\"").append(escapeJson(r)).append("\"}");
-            }
-            resultsJson.append("]}");
-            sendResponse(out, 200, "application/json; charset=UTF-8", resultsJson.toString());
+        String sp = slotParam.trim();
+        if ("all".equalsIgnoreCase(sp)) {
+            ScriptRunner.runStartupScriptsConcurrently(appContext, null, logger);
+            sendResponse(out, 200, "application/json; charset=UTF-8",
+                    "{\"ok\":true,\"status\":\"Launched " + cfg.startupScripts.size() + " startup script(s) concurrently\"}");
             return;
         }
 
-        int jobNum = SyncRunner.parseIntSafe(jp, -1);
-        int jobIdx = (jobNum >= 1 && jobNum <= 5) ? (jobNum - 1) : jobNum;
-        if (jobIdx < 0 || jobIdx >= 5) {
+        int idx = ScriptRunner.parseIntSafe(sp, -1) - 1;
+        if (idx < 0 || idx >= cfg.startupScripts.size()) {
             sendResponse(out, 400, "application/json; charset=UTF-8",
-                    "{\"ok\":false,\"error\":\"Invalid job index (use 1..5 or all)\"}");
+                    "{\"ok\":false,\"error\":\"Invalid startup script index\"}");
             return;
         }
 
-        String status = SyncRunner.runJobAndScript(appContext, null, jobIdx, runScript, logger);
+        String targetScript = cfg.startupScripts.get(idx);
+        String status = ScriptRunner.executeCommandOrLua(appContext, null, targetScript, null, logger);
         sendResponse(out, 200, "application/json; charset=UTF-8",
-                "{\"ok\":true,\"job\":" + (jobIdx + 1) + ",\"status\":\"" + escapeJson(status) + "\"}");
+                "{\"ok\":true,\"script\":" + (idx + 1) + ",\"path\":\"" + escapeJson(targetScript) + "\",\"status\":\"" + escapeJson(status) + "\"}");
     }
 
     public static synchronized SqlQueryResult executeSqlWithSqlDroid(String dbPath, String sql) {
@@ -645,10 +646,10 @@ public class SqlHttpServer {
         String errBlock = (errorMsg != null && errorMsg.length() > 0)
                 ? "<p style='color:#c62828;font-weight:bold'>" + errorMsg + "</p>" : "";
         return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Asyncer Login</title>"
+                + "<title>AndroLua Login</title>"
                 + "<style>body{font-family:sans-serif;max-width:420px;margin:40px auto;padding:0 16px}"
                 + "input,button{width:100%;margin:8px 0;padding:10px;box-sizing:border-box}</style></head><body>"
-                + "<h2>Asyncer Login</h2>"
+                + "<h2>AndroLua Login</h2>"
                 + errBlock
                 + "<form method='POST' action='/'>"
                 + "<label>Username:</label><input name='user' required autofocus>"
@@ -657,22 +658,21 @@ public class SqlHttpServer {
                 + "</form></body></html>";
     }
 
-    // Rendered ONLY after valid user & pass were POSTed; contains NO login/password boxes
     private static String buildAuthenticatedConsoleHtml(String authUser, String authPass) {
         return "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
-                + "<title>Asyncer SQL & Sync Server</title>"
+                + "<title>AndroLua SQL & Script Server</title>"
                 + "<style>body{font-family:sans-serif;max-width:760px;margin:20px auto;padding:0 12px}"
-                + "textarea,select,button{width:100%;margin:6px 0;padding:8px;box-sizing:border-box}"
+                + "textarea,input,button{width:100%;margin:6px 0;padding:8px;box-sizing:border-box}"
                 + "pre{background:#111;color:#0f0;padding:12px;overflow:auto;min-height:120px}</style></head><body>"
-                + "<h2>Asyncer SQLDroid & Sync Console</h2>"
+                + "<h2>AndroLua SQLDroid & Lua Console</h2>"
                 + "<h3>1. Run SQL Query (Base64 UTF-8 Encoded)</h3>"
                 + "<textarea id='q' rows='5'>SELECT sqlite_version() AS version;</textarea>"
                 + "<button onclick='runSql()'>Execute SQL (POST /sql)</button>"
-                + "<h3>2. Run Sync Job & Associated Script</h3>"
-                + "<select id='j'><option value='1'>Job 1</option><option value='2'>Job 2</option>"
-                + "<option value='3'>Job 3</option><option value='4'>Job 4</option><option value='5'>Job 5</option>"
-                + "<option value='all'>All Jobs</option></select>"
-                + "<button onclick='runJob()'>Run Sync Job (POST /run_job)</button>"
+                + "<h3>2. Run Lua Script (Path or Inline Lua)</h3>"
+                + "<input id='sp' placeholder='/sdcard/androlua/script.lua'>"
+                + "<button onclick='runPath()'>Run Script Path (POST /run_script)</button>"
+                + "<textarea id='lc' rows='5'>toast('Hello from HTTP!', false)\nreturn 'OK'</textarea>"
+                + "<button onclick='runInline()'>Run Inline Lua (POST /run_script)</button>"
                 + "<pre id='out'>Authenticated.</pre>"
                 + "<script>"
                 + "const AUTH_U=\"" + escapeJson(authUser) + "\";"
@@ -681,9 +681,12 @@ public class SqlHttpServer {
                 + "async function runSql(){"
                 + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,query_b64:b64Utf8(q.value)});"
                 + "const r=await fetch('/sql',{method:'POST',body});out.textContent=await r.text();}"
-                + "async function runJob(){"
-                + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,job:j.value});"
-                + "const r=await fetch('/run_job',{method:'POST',body});out.textContent=await r.text();}"
+                + "async function runPath(){"
+                + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,path:sp.value});"
+                + "const r=await fetch('/run_script',{method:'POST',body});out.textContent=await r.text();}"
+                + "async function runInline(){"
+                + "const body=new URLSearchParams({user:AUTH_U,pass:AUTH_P,code_b64:b64Utf8(lc.value)});"
+                + "const r=await fetch('/run_script',{method:'POST',body});out.textContent=await r.text();}"
                 + "</script></body></html>";
     }
-                        }
+}
