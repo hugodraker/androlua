@@ -1,0 +1,5 @@
+print("Hello from LuaJ to Logcat!")
+print("Hello, World!")
+local file = io.open("example.txt", "w")
+file:write("Hello, Lua!")
+file:close()
