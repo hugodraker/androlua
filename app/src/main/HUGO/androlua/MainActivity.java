@@ -221,16 +221,17 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(24, 26, 31));
 
-        // 1. Top Status Bar
+        
+// 1. Top Status Bar (Compact)
         tvHeader = new TextView(this);
         tvHeader.setBackgroundColor(Color.rgb(38, 42, 50));
         tvHeader.setTextColor(Color.rgb(220, 228, 240));
-        tvHeader.setTextSize(12.0f);
-        tvHeader.setPadding(12, 8, 12, 8);
+        tvHeader.setTextSize(11.0f);
+        tvHeader.setPadding(8, 2, 8, 2);
         tvHeader.setSingleLine(true);
         root.addView(tvHeader, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-
+        
         // 2. Code Editor Area (68% vertical space, word-wrap disabled by default)
         etEditor = new EditText(this);
         etEditor.setTypeface(Typeface.MONOSPACE);
