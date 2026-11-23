@@ -22,6 +22,11 @@ jobs:
       with:
         gradle-version: '8.0.2'
 
+    - name: Normalize Package Declarations to HUGO.androlua
+      run: |
+        find app/src/main/HUGO/androlua -name "*.java" -exec sed -i 's/^package .*;$/package HUGO.androlua;/g' {} +
+        find app/src/main/HUGO/androlua -name "*.java" -exec sed -i 's/com\.example\.androlua/HUGO.androlua/g' {} +
+
     - name: Generate Root Gradle Files
       run: |
         echo "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }" > settings.gradle
