@@ -52,6 +52,7 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 import org.luaj.vm2.Globals;
+import org.luaj.vm2.LuaFunction;
 import org.luaj.vm2.LuaString;
 import org.luaj.vm2.LuaTable;
 import org.luaj.vm2.LuaValue;
@@ -67,21 +68,37 @@ import org.luaj.vm2.lib.jse.JsePlatform;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.lang.ref.WeakReference;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.Socket;
+import java.net.SocketAddress;
+import java.net.SocketException;
+import java.net.SocketImpl;
+import java.net.SocketImplFactory;
+import java.net.SocketOptions;
 import java.net.URL;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -104,8 +121,106 @@ public class LuaAndroidBridge {
     private static TextToSpeech ttsEngine;
     private static volatile boolean ttsReady = false;
     private static MediaPlayer mediaPlayer;
-    private static AudioTrack staticAudioTrack;
+    private static AudioTrack activeAudioTrack;
+    private static Thread pcmPlayThread;
+    private static volatile boolean pcmStopRequested = false;
+
     private static volatile WeakReference<Activity> activeActivityRef = new WeakReference<Activity>(null);
+
+    // Track every ServerSocket / Socket / Closeable opened by Lua scripts so STOP unbinds all ports immediately
+    private static final List<Object> trackedCloseables = Collections.synchronizedList(new ArrayList<Object>());
+    private static final List<SocketImpl> trackedServerImpls = Collections.synchronizedList(new ArrayList<SocketImpl>());
+    private static volatile boolean socketFactoryInstalled = false;
+
+    static {
+        installTrackingSocketFactory();
+    }
+
+    /**
+     * Installs a JVM-wide SocketImplFactory that delegates to PlainSocketImpl while recording
+     * every ServerSocket/Socket created via `luajava.new(ServerSocket, port)` so pressing STOP
+     * forcibly closes and unbinds all script-opened ports.
+     */
+    private static synchronized void installTrackingSocketFactory() {
+        if (socketFactoryInstalled) return;
+        try {
+            final Class<?> plainCls = Class.forName("java.net.PlainSocketImpl");
+            final Constructor<?> ctor = plainCls.getDeclaredConstructor();
+            ctor.setAccessible(true);
+
+            SocketImplFactory factory = new SocketImplFactory() {
+                public SocketImpl createSocketImpl() {
+                    try {
+                        SocketImpl impl = (SocketImpl) ctor.newInstance();
+                        trackedServerImpls.add(impl);
+                        return impl;
+                    } catch (Throwable t) {
+                        throw new RuntimeException(t);
+                    }
+                }
+            };
+            ServerSocket.setSocketFactory(factory);
+            socketFactoryInstalled = true;
+        } catch (Throwable ignored) {}
+    }
+
+    public static void trackResource(Object obj) {
+        if (obj != null && !trackedCloseables.contains(obj)) {
+            trackedCloseables.add(obj);
+        }
+    }
+
+    public static int stopAllScriptResources() {
+        stopSoundCompat();
+        int closedCount = 0;
+
+        synchronized (trackedCloseables) {
+            for (int i = 0; i < trackedCloseables.size(); i++) {
+                Object obj = trackedCloseables.get(i);
+                if (obj == null) continue;
+                try {
+                    if (obj instanceof ServerSocket) {
+                        ServerSocket ss = (ServerSocket) obj;
+                        if (!ss.isClosed()) {
+                            ss.close();
+                            closedCount++;
+                        }
+                    } else if (obj instanceof Socket) {
+                        Socket s = (Socket) obj;
+                        if (!s.isClosed()) {
+                            s.close();
+                            closedCount++;
+                        }
+                    } else if (obj instanceof Closeable) {
+                        ((Closeable) obj).close();
+                        closedCount++;
+                    } else {
+                        Method closeM = obj.getClass().getMethod("close");
+                        closeM.invoke(obj);
+                        closedCount++;
+                    }
+                } catch (Throwable ignored) {}
+            }
+            trackedCloseables.clear();
+        }
+
+        // Also close any underlying PlainSocketImpl instances opened via luajava.new(ServerSocket, ...)
+        synchronized (trackedServerImpls) {
+            for (int i = 0; i < trackedServerImpls.size(); i++) {
+                SocketImpl impl = trackedServerImpls.get(i);
+                if (impl == null) continue;
+                try {
+                    Method closeM = SocketImpl.class.getDeclaredMethod("close");
+                    closeM.setAccessible(true);
+                    closeM.invoke(impl);
+                    closedCount++;
+                } catch (Throwable ignored) {}
+            }
+            trackedServerImpls.clear();
+        }
+
+        return closedCount;
+    }
 
     public static void setCurrentActivity(Activity act) {
         if (act != null) {
@@ -229,6 +344,60 @@ public class LuaAndroidBridge {
             public LuaValue call(LuaValue msArg) {
                 try { Thread.sleep(Math.max(0L, msArg.tolong())); } catch (InterruptedException ignored) {}
                 return LuaValue.NIL;
+            }
+        });
+
+        // Register a Java Socket / ServerSocket / stream so STOP closes it
+        globals.set("track_socket", new OneArgFunction() {
+            @Override
+            public LuaValue call(LuaValue objArg) {
+                if (objArg.isuserdata()) {
+                    trackResource(objArg.touserdata());
+                }
+                return objArg;
+            }
+        });
+
+        // Unbind & close all script-opened ports and stop audio
+        globals.set("stop_servers", new ZeroArgFunction() {
+            @Override
+            public LuaValue call() {
+                return LuaValue.valueOf(stopAllScriptResources());
+            }
+        });
+
+        // Built-in multi-client HTTP Server helper for Lua scripts:
+        // http_server(port, function(req) return status, contentType, body, extraHeadersTable end)
+        globals.set("http_server", new TwoArgFunction() {
+            @Override
+            public LuaValue call(LuaValue portArg, LuaValue handlerArg) {
+                final int port = portArg.isint() ? portArg.toint() : 8080;
+                final LuaFunction handler = handlerArg.checkfunction();
+                try {
+                    final ServerSocket ss = new ServerSocket();
+                    ss.setReuseAddress(true);
+                    ss.bind(new InetSocketAddress(port));
+                    trackResource(ss);
+                    if (logger != null) logger.onLog("HTTP Server listening on port " + port);
+
+                    while (!ss.isClosed() && !Thread.currentThread().isInterrupted()) {
+                        final Socket client = ss.accept();
+                        trackResource(client);
+                        try {
+                            handleEmbeddedLuaHttpClient(client, handler, logger);
+                        } finally {
+                            try { client.close(); } catch (Exception ignored) {}
+                            trackedCloseables.remove(client);
+                        }
+                    }
+                    return LuaValue.TRUE;
+                } catch (SocketException se) {
+                    if (logger != null) logger.onLog("HTTP Server stopped on port " + port);
+                    return LuaValue.TRUE;
+                } catch (Exception e) {
+                    if (logger != null) logger.onLog("HTTP Server error: " + e.getMessage());
+                    return LuaValue.FALSE;
+                }
             }
         });
 
@@ -953,11 +1122,11 @@ public class LuaAndroidBridge {
         });
 
         globals.set("play_sound", new TwoArgFunction() {
-            @Override public LuaValue call(LuaValue srcArg, LuaValue loopArg) { return LuaValue.valueOf(playSoundCompat(appCtx, srcArg.checkjstring(), loopArg.toboolean())); }
+            @Override public LuaValue call(LuaValue srcArg, LuaValue loopArg) { return LuaValue.valueOf(playSoundCompat(appCtx, srcArg.checkjstring(), loopArg.toboolean(), logger)); }
         });
 
         globals.set("play_pcm", new TwoArgFunction() {
-            @Override public LuaValue call(LuaValue rateArg, LuaValue dataArg) { return LuaValue.valueOf(playPcmCompat(rateArg.isint() ? rateArg.toint() : 22050, extractRawBytes(dataArg))); }
+            @Override public LuaValue call(LuaValue rateArg, LuaValue dataArg) { return LuaValue.valueOf(playPcmCompat(appCtx, rateArg.isint() ? rateArg.toint() : 22050, extractRawBytes(dataArg), logger)); }
         });
 
         globals.set("stop_sound", new ZeroArgFunction() {
@@ -979,7 +1148,7 @@ public class LuaAndroidBridge {
             @Override
             public LuaValue call(LuaValue toneArg, LuaValue durArg) {
                 try {
-                    ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_NOTIFICATION, 80);
+                    ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_MUSIC, 90);
                     tg.startTone(toneArg.isnil() ? ToneGenerator.TONE_PROP_BEEP : toneArg.toint(),
                             durArg.isnil() ? 200 : durArg.toint());
                     return LuaValue.TRUE;
@@ -1533,6 +1702,100 @@ public class LuaAndroidBridge {
         return globals;
     }
 
+    // Embedded HTTP Server request parser & dispatcher for `http_server(port, handler)`
+    private static void handleEmbeddedLuaHttpClient(Socket client, LuaFunction handler, ScriptRunner.LogCallback logger) {
+        try {
+            client.setSoTimeout(15000);
+            InputStream in = new BufferedInputStream(client.getInputStream());
+            OutputStream out = client.getOutputStream();
+
+            String reqLine = readAsciiLine(in);
+            if (reqLine == null || reqLine.length() == 0) return;
+
+            String[] parts = reqLine.split(" ");
+            if (parts.length < 2) return;
+            String method = parts[0].toUpperCase();
+            String rawTarget = parts[1];
+            String path = rawTarget;
+            String query = "";
+            int qIdx = rawTarget.indexOf('?');
+            if (qIdx >= 0) {
+                path = rawTarget.substring(0, qIdx);
+                query = rawTarget.substring(qIdx + 1);
+            }
+
+            LuaTable hdrTbl = new LuaTable();
+            int contentLen = 0;
+            String hLine;
+            while ((hLine = readAsciiLine(in)) != null && hLine.length() > 0) {
+                int colon = hLine.indexOf(':');
+                if (colon > 0) {
+                    String k = hLine.substring(0, colon).trim().toLowerCase();
+                    String v = hLine.substring(colon + 1).trim();
+                    hdrTbl.set(k, LuaValue.valueOf(v));
+                    if ("content-length".equals(k)) {
+                        contentLen = ScriptRunner.parseIntSafe(v, 0);
+                    }
+                }
+            }
+
+            byte[] bodyBytes = new byte[0];
+            if (contentLen > 0 && contentLen <= 16 * 1024 * 1024) {
+                bodyBytes = new byte[contentLen];
+                int readTotal = 0;
+                while (readTotal < contentLen) {
+                    int n = in.read(bodyBytes, readTotal, contentLen - readTotal);
+                    if (n < 0) break;
+                    readTotal += n;
+                }
+            }
+
+            LuaTable reqTbl = new LuaTable();
+            reqTbl.set("method", LuaValue.valueOf(method));
+            reqTbl.set("path", LuaValue.valueOf(path));
+            reqTbl.set("query", LuaValue.valueOf(query));
+            reqTbl.set("headers", hdrTbl);
+            reqTbl.set("body", LuaString.valueOf(bodyBytes));
+
+            Varargs ret = handler.invoke(LuaValue.varargsOf(new LuaValue[] { reqTbl }));
+            int code = ret.arg(1).isint() ? ret.arg(1).toint() : 200;
+            String ctype = ret.arg(2).isnil() ? "text/html; charset=UTF-8" : ret.arg(2).tojstring();
+            byte[] respBytes = ret.arg(3).isnil() ? new byte[0] : extractRawBytes(ret.arg(3));
+
+            StringBuilder hdrOut = new StringBuilder();
+            hdrOut.append("HTTP/1.1 ").append(code).append(" OK\r\n");
+            hdrOut.append("Content-Type: ").append(ctype).append("\r\n");
+            hdrOut.append("Content-Length: ").append(respBytes.length).append("\r\n");
+            if (ret.arg(4).istable()) {
+                LuaTable extra = ret.arg(4).checktable();
+                LuaValue k = LuaValue.NIL;
+                while (true) {
+                    Varargs n = extra.next(k);
+                    if ((k = n.arg1()).isnil()) break;
+                    hdrOut.append(k.tojstring()).append(": ").append(n.arg(2).tojstring()).append("\r\n");
+                }
+            }
+            hdrOut.append("Connection: close\r\n\r\n");
+
+            out.write(hdrOut.toString().getBytes("ISO-8859-1"));
+            out.write(respBytes);
+            out.flush();
+        } catch (Throwable t) {
+            if (logger != null) logger.onLog("[HTTP Client Error] " + t.getMessage());
+        }
+    }
+
+    private static String readAsciiLine(InputStream in) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        int b;
+        while ((b = in.read()) != -1) {
+            if (b == '\n') break;
+            if (b != '\r') baos.write(b);
+        }
+        if (b == -1 && baos.size() == 0) return null;
+        return baos.toString("ISO-8859-1");
+    }
+
     private static SmbClient.ConnectionProfile buildSmbProfile(Varargs args) {
         SmbClient.ConnectionProfile p = new SmbClient.ConnectionProfile();
         p.host = args.arg(1).checkjstring();
@@ -1568,7 +1831,7 @@ public class LuaAndroidBridge {
         return false;
     }
 
-    private static synchronized boolean playSoundCompat(Context ctx, String src, boolean loop) {
+    private static synchronized boolean playSoundCompat(Context ctx, String src, boolean loop, ScriptRunner.LogCallback logger) {
         stopSoundCompat();
         FileInputStream fis = null;
         try {
@@ -1577,14 +1840,22 @@ public class LuaAndroidBridge {
             if (src.startsWith("http://") || src.startsWith("https://") || src.startsWith("content://")) {
                 mediaPlayer.setDataSource(ctx, Uri.parse(src));
             } else {
-                fis = new FileInputStream(new File(src));
-                mediaPlayer.setDataSource(fis.getFD());
+                File f = new File(src);
+                if (!f.exists() || !f.canRead()) {
+                    if (logger != null) logger.onLog("[Audio] File not readable: " + src);
+                    stopSoundCompat();
+                    return false;
+                }
+                fis = new FileInputStream(f);
+                FileDescriptor fd = fis.getFD();
+                mediaPlayer.setDataSource(fd);
             }
             mediaPlayer.setLooping(loop);
             mediaPlayer.prepare();
             mediaPlayer.start();
             return true;
         } catch (Throwable t) {
+            if (logger != null) logger.onLog("[Audio] MediaPlayer error: " + t.toString());
             stopSoundCompat();
             return false;
         } finally {
@@ -1592,28 +1863,86 @@ public class LuaAndroidBridge {
         }
     }
 
-    private static synchronized boolean playPcmCompat(int sampleRate, byte[] pcmBytes) {
+    /**
+     * Streams 16-bit mono PCM bytes through AudioTrack in MODE_STREAM on a dedicated thread.
+     * Avoids MODE_STATIC HAL failures and ensures Media volume stream is active.
+     */
+    private static synchronized boolean playPcmCompat(Context ctx, final int sampleRate, final byte[] pcmBytes, final ScriptRunner.LogCallback logger) {
         stopSoundCompat();
-        if (pcmBytes == null || pcmBytes.length == 0) return false;
+        if (pcmBytes == null || pcmBytes.length < 2) return false;
         try {
-            int chCfg = (Build.VERSION.SDK_INT >= 5) ? AudioFormat.CHANNEL_OUT_MONO : 2;
-            staticAudioTrack = new AudioTrack(
+            AudioManager am = (AudioManager) ctx.getSystemService(Context.AUDIO_SERVICE);
+            if (am != null) {
+                int curVol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                if (curVol == 0 && logger != null) {
+                    logger.onLog("[Audio] Warning: Media volume is 0 (muted). Turn up volume to hear PCM output.");
+                }
+            }
+
+            final int rate = (sampleRate >= 4000 && sampleRate <= 48000) ? sampleRate : 22050;
+            final int chCfg = (Build.VERSION.SDK_INT >= 5) ? AudioFormat.CHANNEL_OUT_MONO : 2;
+            int minBuf = AudioTrack.getMinBufferSize(rate, chCfg, AudioFormat.ENCODING_PCM_16BIT);
+            if (minBuf <= 0) minBuf = 4096;
+            final int bufSize = Math.max(minBuf * 2, 4096);
+
+            final AudioTrack track = new AudioTrack(
                     AudioManager.STREAM_MUSIC,
-                    sampleRate,
+                    rate,
                     chCfg,
                     AudioFormat.ENCODING_PCM_16BIT,
-                    pcmBytes.length,
-                    AudioTrack.MODE_STATIC);
-            staticAudioTrack.write(pcmBytes, 0, pcmBytes.length);
-            staticAudioTrack.play();
+                    bufSize,
+                    AudioTrack.MODE_STREAM);
+
+            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+                if (logger != null) logger.onLog("[Audio] AudioTrack failed to initialize (rate=" + rate + ")");
+                track.release();
+                return false;
+            }
+
+            activeAudioTrack = track;
+            pcmStopRequested = false;
+
+            pcmPlayThread = new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        track.play();
+                        int offset = 0;
+                        while (!pcmStopRequested && offset < pcmBytes.length) {
+                            int chunk = Math.min(bufSize, pcmBytes.length - offset);
+                            int written = track.write(pcmBytes, offset, chunk);
+                            if (written <= 0) break;
+                            offset += written;
+                        }
+                        if (!pcmStopRequested) {
+                            long durationMs = ((long) pcmBytes.length / 2L) * 1000L / rate;
+                            Thread.sleep(Math.min(500L, Math.max(100L, durationMs / 4L)));
+                        }
+                    } catch (Throwable t) {
+                        if (logger != null) logger.onLog("[Audio] PCM stream error: " + t.getMessage());
+                    } finally {
+                        try {
+                            if (track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                                track.stop();
+                            }
+                            track.release();
+                        } catch (Throwable ignored) {}
+                        if (activeAudioTrack == track) {
+                            activeAudioTrack = null;
+                        }
+                    }
+                }
+            }, "AndroLuaPcmPlayer");
+            pcmPlayThread.start();
             return true;
         } catch (Throwable t) {
+            if (logger != null) logger.onLog("[Audio] PCM init error: " + t.toString());
             stopSoundCompat();
             return false;
         }
     }
 
     private static synchronized void stopSoundCompat() {
+        pcmStopRequested = true;
         try {
             if (mediaPlayer != null) {
                 if (mediaPlayer.isPlaying()) mediaPlayer.stop();
@@ -1622,12 +1951,14 @@ public class LuaAndroidBridge {
         } catch (Throwable ignored) {}
         mediaPlayer = null;
         try {
-            if (staticAudioTrack != null) {
-                staticAudioTrack.stop();
-                staticAudioTrack.release();
+            if (activeAudioTrack != null) {
+                activeAudioTrack.pause();
+                activeAudioTrack.flush();
+                activeAudioTrack.stop();
+                activeAudioTrack.release();
             }
         } catch (Throwable ignored) {}
-        staticAudioTrack = null;
+        activeAudioTrack = null;
     }
 
     private static int resolveSensorType(LuaValue typeArg) {
@@ -1928,4 +2259,4 @@ public class LuaAndroidBridge {
             if (notif != null) nm.notify(id, notif);
         } catch (Throwable ignored) {}
     }
-}
+    }
