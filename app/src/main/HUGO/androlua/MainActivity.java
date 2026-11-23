@@ -18,7 +18,9 @@ import android.os.Looper;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.Selection;
+import android.text.Spannable;
 import android.text.TextWatcher;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
@@ -40,6 +42,8 @@ import java.io.StringWriter;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class MainActivity extends Activity {
 
@@ -57,9 +61,33 @@ public class MainActivity extends Activity {
     private EditText etOutput;
     private File currentFile = null;
     private int editorFontSize = 14;
-    private boolean wordWrap = true;
+    private boolean wordWrap = false; // Disabled by default
     private String lastSearchQuery = "";
     private boolean lastMatchCase = false;
+
+    // Lua Syntax Highlighting Patterns
+    private volatile boolean isHighlighting = false;
+    private final Runnable highlightRunnable = new Runnable() {
+        public void run() {
+            applyLuaSyntaxHighlighting();
+        }
+    };
+
+    private static final Pattern PAT_KEYWORDS = Pattern.compile(
+            "\\b(and|break|do|else|elseif|end|false|for|function|goto|if|in|local|nil|not|or|repeat|return|then|true|until|while)\\b");
+    private static final Pattern PAT_BUILTINS = Pattern.compile(
+            "\\b(print|log|sleep|toast|dialog|confirm|prompt|choose|multi_choose|date_picker|time_picker|progress_dialog|html_dialog|" +
+            "screen_info|keep_screen_on|notify|download|http_get|http_post|http_request|http_server|stop_servers|track_socket|" +
+            "url_encode|url_decode|ftp_upload|ftp_download|ftp_list|ftp_delete|ftp_mkdir|smb_shares|smb_upload|smb_download|" +
+            "smb_list|smb_delete|smb_mkdir|speak|stop_speak|play_sound|play_pcm|stop_sound|vibrate|beep|read_binary|write_binary|" +
+            "read_bytes|write_bytes|base64_encode|base64_decode|hex_encode|hex_decode|hash_data|hash_file|files_dir|cache_dir|" +
+            "sdcard_dir|read_file|write_file|copy_file|move_file|rename_file|file_info|file_exists|mkdirs|delete_file|list_dir|" +
+            "list_sensors|read_sensor|get_location|sql_query|json_encode|json_decode|shell|open_url|open_file|launch_app|" +
+            "share_text|send_broadcast|start_activity|set_clipboard|get_clipboard|battery_info|network_info|device_info|" +
+            "prefs_get|prefs_set|require|pairs|ipairs|tonumber|tostring|type|pcall|xpcall|error|assert|luajava|string|table|math|io|os)\\b");
+    private static final Pattern PAT_NUMBERS = Pattern.compile("\\b(0x[0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b");
+    private static final Pattern PAT_STRINGS = Pattern.compile("(\\[\\[[\\s\\S]*?\\]\\]|\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*')");
+    private static final Pattern PAT_COMMENTS = Pattern.compile("(--\\[\\[[\\s\\S]*?\\]\\]|--[^\\n]*)");
 
     // Temporary references for Settings dialog file pickers
     private EditText activeSettingsDbInput;
@@ -163,7 +191,7 @@ public class MainActivity extends Activity {
             config.global.put("run_on_boot", "1");
             config.global.put("run_scripts_on_start", "0");
             config.global.put("font_size", "14");
-            config.global.put("word_wrap", "1");
+            config.global.put("word_wrap", "0"); // Disabled by default
             config.global.put("sql_server_enabled", "0");
             config.global.put("http_port", "8080");
             config.global.put("http_user", "admin");
@@ -172,7 +200,7 @@ public class MainActivity extends Activity {
             ScriptRunner.saveIniConfig(iniFile, config);
         }
         editorFontSize = ScriptRunner.parseIntSafe(config.global.get("font_size"), 14);
-        wordWrap = !"0".equals(config.global.get("word_wrap"));
+        wordWrap = "1".equals(config.global.get("word_wrap")) || "true".equalsIgnoreCase(config.global.get("word_wrap"));
     }
 
     private void saveConfig() {
@@ -203,7 +231,7 @@ public class MainActivity extends Activity {
         root.addView(tvHeader, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
 
-        // 2. Code Editor Area (68% vertical space)
+        // 2. Code Editor Area (68% vertical space, word-wrap disabled by default)
         etEditor = new EditText(this);
         etEditor.setTypeface(Typeface.MONOSPACE);
         etEditor.setTextSize((float) editorFontSize);
@@ -223,7 +251,12 @@ public class MainActivity extends Activity {
         etEditor.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
             public void onTextChanged(CharSequence s, int start, int before, int count) {}
-            public void afterTextChanged(Editable s) { updateHeaderStatus(); }
+            public void afterTextChanged(Editable s) {
+                if (isHighlighting) return;
+                updateHeaderStatus();
+                uiHandler.removeCallbacks(highlightRunnable);
+                uiHandler.postDelayed(highlightRunnable, 120);
+            }
         });
 
         root.addView(etEditor, new LinearLayout.LayoutParams(
@@ -276,7 +309,7 @@ public class MainActivity extends Activity {
         root.addView(etOutput, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 0.32f));
 
-        // 5. Bottom Jota-Style Action Button Toolbar
+        // 5. Bottom Jota-Style Action Button Toolbar (RUN followed immediately by STOP)
         HorizontalScrollView bottomScroll = new HorizontalScrollView(this);
         bottomScroll.setBackgroundColor(Color.rgb(36, 40, 48));
         bottomScroll.setHorizontalScrollBarEnabled(false);
@@ -287,6 +320,9 @@ public class MainActivity extends Activity {
 
         addToolbarButton(btnBar, "RUN", Color.rgb(46, 125, 50), new View.OnClickListener() {
             public void onClick(View v) { runCurrentEditorScript(); }
+        });
+        addToolbarButton(btnBar, "STOP", Color.rgb(198, 40, 40), new View.OnClickListener() {
+            public void onClick(View v) { stopAllRunningScriptsAndPorts(); }
         });
         addToolbarButton(btnBar, "New", 0, new View.OnClickListener() {
             public void onClick(View v) { confirmDiscardAndNew(); }
@@ -328,6 +364,49 @@ public class MainActivity extends Activity {
 
         setContentView(root);
         updateHeaderStatus();
+    }
+
+    // =========================================================================
+    // LUA SYNTAX HIGHLIGHTING
+    // =========================================================================
+
+    private void applyLuaSyntaxHighlighting() {
+        if (etEditor == null) return;
+        Editable ed = etEditor.getText();
+        if (ed == null || ed.length() == 0) return;
+        // Cap live highlighting at 120 KB to keep typing instant on huge files
+        if (ed.length() > 120000) return;
+
+        isHighlighting = true;
+        try {
+            ForegroundColorSpan[] oldSpans = ed.getSpans(0, ed.length(), ForegroundColorSpan.class);
+            for (int i = 0; i < oldSpans.length; i++) {
+                ed.removeSpan(oldSpans[i]);
+            }
+
+            String src = ed.toString();
+
+            // 1. Numbers (orange)
+            applyPatternColor(ed, src, PAT_NUMBERS, Color.rgb(247, 140, 108));
+            // 2. Built-in Android/Lua API functions (cyan)
+            applyPatternColor(ed, src, PAT_BUILTINS, Color.rgb(130, 170, 255));
+            // 3. Lua Keywords (purple)
+            applyPatternColor(ed, src, PAT_KEYWORDS, Color.rgb(199, 146, 234));
+            // 4. Strings (green)
+            applyPatternColor(ed, src, PAT_STRINGS, Color.rgb(195, 232, 141));
+            // 5. Comments (muted gray-green, overrides spans inside comments)
+            applyPatternColor(ed, src, PAT_COMMENTS, Color.rgb(106, 153, 85));
+        } catch (Throwable ignored) {
+        } finally {
+            isHighlighting = false;
+        }
+    }
+
+    private void applyPatternColor(Editable ed, String src, Pattern pat, int color) {
+        Matcher m = pat.matcher(src);
+        while (m.find()) {
+            ed.setSpan(new ForegroundColorSpan(color), m.start(), m.end(), Spannable.SPAN_EXCLUSIVE_EXCLUSIVE);
+        }
     }
 
     private Button makeSmallHeaderButton(String label) {
@@ -454,7 +533,7 @@ public class MainActivity extends Activity {
     }
 
     // =========================================================================
-    // RUN, NEW, OPEN, SAVE, SAVE AS, COPY, PASTE
+    // RUN, STOP (UNBIND ALL PORTS), NEW, OPEN, SAVE, SAVE AS, COPY, PASTE
     // =========================================================================
 
     private void runCurrentEditorScript() {
@@ -464,29 +543,43 @@ public class MainActivity extends Activity {
             writeTextFile(currentFile, code);
         }
         appendOutput("\n--- Running " + name + " ---");
-        new Thread(new Runnable() {
+        Thread runThread = new Thread(new Runnable() {
             public void run() {
-                String res;
-                if (currentFile != null && !currentFile.getName().toLowerCase().endsWith(".lua")) {
-                    res = ScriptRunner.executeCommandOrLua(MainActivity.this, MainActivity.this,
-                            currentFile.getAbsolutePath(), null, new ScriptRunner.LogCallback() {
-                                public void onLog(String msg) { appendOutput(msg); }
-                            });
-                } else {
-                    res = ScriptRunner.executeLuaCodeString(MainActivity.this, MainActivity.this,
-                            code, name, null, new ScriptRunner.LogCallback() {
-                                public void onLog(String msg) { appendOutput(msg); }
-                            });
+                ScriptRunner.registerScriptThread(Thread.currentThread());
+                try {
+                    String res;
+                    if (currentFile != null && !currentFile.getName().toLowerCase().endsWith(".lua")) {
+                        res = ScriptRunner.executeCommandOrLua(MainActivity.this, MainActivity.this,
+                                currentFile.getAbsolutePath(), null, new ScriptRunner.LogCallback() {
+                                    public void onLog(String msg) { appendOutput(msg); }
+                                });
+                    } else {
+                        res = ScriptRunner.executeLuaCodeString(MainActivity.this, MainActivity.this,
+                                code, name, null, new ScriptRunner.LogCallback() {
+                                    public void onLog(String msg) { appendOutput(msg); }
+                                });
+                    }
+                    appendOutput("--- Finished: " + res + " ---");
+                } finally {
+                    ScriptRunner.unregisterScriptThread(Thread.currentThread());
                 }
-                appendOutput("--- Finished: " + res + " ---");
             }
-        }).start();
+        }, "AndroLuaEditorRun");
+        runThread.start();
+    }
+
+    private void stopAllRunningScriptsAndPorts() {
+        int stoppedThreads = ScriptRunner.stopAllRunningScripts();
+        String msg = "[STOP] Interrupted " + stoppedThreads + " script thread(s), stopped audio, and unbound all script ports.";
+        appendOutput(msg);
+        Toast.makeText(this, "Stopped scripts & unbound ports", Toast.LENGTH_SHORT).show();
     }
 
     private void newScriptTemplate() {
         currentFile = null;
         etEditor.setText("-- AndroLua Script\nprint(\"Hello from AndroLua!\")\ntoast(\"Script running\", false)\n");
         updateHeaderStatus();
+        applyLuaSyntaxHighlighting();
     }
 
     private void confirmDiscardAndNew() {
@@ -1303,6 +1396,7 @@ public class MainActivity extends Activity {
             etEditor.setText(baos.toString("UTF-8"));
             saveConfig();
             updateHeaderStatus();
+            applyLuaSyntaxHighlighting();
         } catch (Exception e) {
             Toast.makeText(this, "Open error: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -1320,6 +1414,7 @@ public class MainActivity extends Activity {
             currentFile = ("file".equalsIgnoreCase(uri.getScheme()) && uri.getPath() != null) ? new File(uri.getPath()) : null;
             etEditor.setText(baos.toString("UTF-8"));
             updateHeaderStatus();
+            applyLuaSyntaxHighlighting();
         } catch (Exception e) {
             Toast.makeText(this, "Read URI error: " + e.getMessage(), Toast.LENGTH_LONG).show();
         }
@@ -1466,4 +1561,4 @@ public class MainActivity extends Activity {
             smClass.getMethod("setThreadPolicy", tpClass).invoke(null, pol);
         } catch (Throwable ignored) {}
     }
-}
+                                     }
