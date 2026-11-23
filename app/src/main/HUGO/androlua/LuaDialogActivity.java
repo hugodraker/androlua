@@ -1,4 +1,4 @@
-package com.HUGO.asyncer;
+package HUGO.asyncer;
 
 import android.app.Activity;
 import android.os.Bundle;
