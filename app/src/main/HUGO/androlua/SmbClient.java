@@ -1,4 +1,4 @@
-package com.HUGO.androlua;
+package HUGO.androlua;
 
 import android.app.Activity;
 import android.app.AlertDialog;
