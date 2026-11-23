@@ -1,4 +1,4 @@
-package com.HUGO.androlua;
+package HUGO.androlua;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
