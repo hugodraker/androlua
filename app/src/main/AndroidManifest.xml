@@ -33,6 +33,7 @@
 
         <activity
             android:name=".MainActivity"
+            android:theme="@android:style/Theme.NoTitleBar"
             android:icon="@android:drawable/ic_menu_edit"
             android:label="AndroLua"
             android:exported="true"
