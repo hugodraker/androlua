@@ -1,4 +1,4 @@
-package com.HUGO.androlua;
+package HUGO.androlua;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
