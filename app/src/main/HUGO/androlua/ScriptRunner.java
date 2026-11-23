@@ -11,6 +11,7 @@ import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +31,35 @@ public class ScriptRunner {
         public int exitCode;
         public String stdout;
         public String stderr;
+    }
+
+    private static final List<Thread> activeScriptThreads =
+            Collections.synchronizedList(new ArrayList<Thread>());
+
+    public static void registerScriptThread(Thread t) {
+        if (t != null) activeScriptThreads.add(t);
+    }
+
+    public static void unregisterScriptThread(Thread t) {
+        if (t != null) activeScriptThreads.remove(t);
+    }
+
+    public static int stopAllRunningScripts() {
+        int count = 0;
+        synchronized (activeScriptThreads) {
+            for (int i = 0; i < activeScriptThreads.size(); i++) {
+                Thread t = activeScriptThreads.get(i);
+                if (t != null && t.isAlive()) {
+                    try {
+                        t.interrupt();
+                        count++;
+                    } catch (Throwable ignored) {}
+                }
+            }
+            activeScriptThreads.clear();
+        }
+        LuaAndroidBridge.stopAllScriptResources();
+        return count;
     }
 
     public static IniConfig loadIniConfig(File iniFile) {
@@ -113,13 +143,19 @@ public class ScriptRunner {
             final String path = cfg.startupScripts.get(i).trim();
             if (path.length() == 0) continue;
             final int slot = i + 1;
-            new Thread(new Runnable() {
+            Thread t = new Thread(new Runnable() {
                 public void run() {
-                    if (logger != null) logger.onLog("[Startup #" + slot + "] Launching: " + path);
-                    String res = executeCommandOrLua(ctx, activity, path, null, logger);
-                    if (logger != null) logger.onLog("[Startup #" + slot + "] Finished (" + new File(path).getName() + "): " + res);
+                    registerScriptThread(Thread.currentThread());
+                    try {
+                        if (logger != null) logger.onLog("[Startup #" + slot + "] Launching: " + path);
+                        String res = executeCommandOrLua(ctx, activity, path, null, logger);
+                        if (logger != null) logger.onLog("[Startup #" + slot + "] Finished (" + new File(path).getName() + "): " + res);
+                    } finally {
+                        unregisterScriptThread(Thread.currentThread());
+                    }
                 }
-            }, "AndroLuaStartup-" + slot).start();
+            }, "AndroLuaStartup-" + slot);
+            t.start();
         }
     }
 
@@ -217,4 +253,4 @@ public class ScriptRunner {
             return def;
         }
     }
-}
+                }
